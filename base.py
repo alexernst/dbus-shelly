@@ -26,9 +26,9 @@ PRODUCT_ID_SHELLY_SWITCH = 0xB074
 class ShellyChannel(SwitchDevice, EnergyMeter, object):
 
 	@classmethod
-	async def create(cls, bus_type=None, serial=None, channel_id=0, has_em=False, has_switch=False, server=None, restart=None, version=VERSION, productid=0x0000, productName="Shelly switch", processName=__file__):
+	async def create(cls, bus_type=None, serial=None, channel_id=0, has_em=False, has_switch=False, server=None, restart=None, version=VERSION, productid=0x0000, productName="Shelly switch", processName=__file__, channel_name_cb=None):
 		bus = await MessageBus(bus_type=bus_type).connect()
-		c = cls(bus, productid, serial, channel_id, version, server, restart, has_em, has_switch, productName, processName)
+		c = cls(bus, productid, serial, channel_id, version, server, restart, has_em, has_switch, productName, processName, channel_name_cb)
 		c.settings = await wait_for_settings(bus)
 
 		role = 'acload' if c._has_em else 'switch'
@@ -39,7 +39,7 @@ class ShellyChannel(SwitchDevice, EnergyMeter, object):
 
 		return c
 
-	def __init__(self, bus, productid, serial, channel_id, version, connection, restart, has_em, has_switch, productName, processName):
+	def __init__(self, bus, productid, serial, channel_id, version, connection, restart, has_em, has_switch, productName, processName, channel_name_cb):
 		self.service = None
 		self.settings = None
 		self._productId = productid
@@ -54,6 +54,7 @@ class ShellyChannel(SwitchDevice, EnergyMeter, object):
 		self._has_switch = has_switch
 		self.productName = productName
 		self.processName = processName
+		self.channel_name_cb = channel_name_cb
 
 		# We don't know the service type yet. Will be .acload if shelly supports energy metering, otherwise .switch.
 		# If the shelly does not support switching, it may be acload, pvinverter or genset.
@@ -75,7 +76,9 @@ class ShellyChannel(SwitchDevice, EnergyMeter, object):
 		self.service.add_item(TextItem('/ProductName', self.productName))
 		self.service.add_item(IntegerItem('/Connected', 1))
 		self.service.add_item(TextItem('/Serial', self._serial))
-		self.service.add_item(TextItem('/CustomName', self.settings.get_value(self.settings.alias("customname_{}_{}".format(self._serial, self._channel_id))), writeable=True, onchange=self._set_customname))
+		initial_custom_name = await self.channel_name_cb()
+
+		self.service.add_item(TextItem('/CustomName', initial_custom_name, writeable=True, onchange=self._set_customname))
 		self.service.add_item(IntegerItem('/State', MODULE_STATE_CONNECTED))
 		self.service.add_item(IntegerItem('/DeviceInstance', int(self.settings.get_value(self.settings.alias('instance_{}_{}'.format(self._serial, self._channel_id))).split(':')[-1])))
 
@@ -93,6 +96,17 @@ class ShellyChannel(SwitchDevice, EnergyMeter, object):
 
 	async def restart(self):
 		await self._restart()
+
+	def channel_config_changed(self):
+		asyncio.create_task(self._set_channel_customname())
+
+		# TODO: other things to handle?
+
+	async def _set_channel_customname(self):
+		name = await self.channel_name_cb()
+		if name is not None:
+			item = self.service.get_item("/CustomName")
+			await self._set_customname(item, name)
 
 	@property
 	def customname(self):
@@ -125,14 +139,15 @@ class ShellyChannel(SwitchDevice, EnergyMeter, object):
 		except:
 			pass # Not a customname change
 
-	def _set_customname(self, value):
-		try:
-			cn = self.settings.get_value(self.settings.alias("customname_{}_{}".format(self._serial, self._channel_id)))
-			if cn != value:
-				self.settings.set_value_async(self.settings.alias("customname_{}_{}".format(self._serial, self._channel_id)), value)
-			return True
-		except:
-			return False
+	async def _set_customname(self, item, value):
+		await self.channel_name_cb(value)
+		item.set_local_value(value)
+
+		# For shelly devices, one service per channel is created, so the /CustomName seen in the devicelist is per channel.
+		# Hence, it makes sense to set both /CustomName and /SwitchableOutput/%s/Settings/CustomName to the same value.
+		# /CustomName will be shown in the device list and /SwitchableOutput/%s/Settings/CustomName will be used in the switch pane.
+		with self.service as s:
+			s['/SwitchableOutput/%s/Settings/CustomName' % self._channel_id] = value
 
 	def value_changed(self, path, value):
 		""" Handle a value change from the settings service. """
@@ -267,7 +282,8 @@ class ShellyDevice(object):
 			restart=partial(self.restart_channel, channel),
 			productid=PRODUCT_ID_SHELLY_SWITCH if self._has_switch else PRODUCT_ID_SHELLY_EM,
 			productName="Shelly switch" if self._has_switch else "Shelly energy meter",
-			processName="dbus-shelly"
+			processName="dbus-shelly",
+			channel_name_cb=partial(self.channel_name, channel),
 		)
 		# Determine service name.
 		if self._has_em:
@@ -280,8 +296,7 @@ class ShellyDevice(object):
 				output_type=1,
 				set_state_cb=partial(self.set_state_cb, channel),
 				valid_functions=(1 << OutputFunction.MANUAL),
-				name="Channel {}".format(channel + 1),
-				customName="Shelly Switch",
+				name="Channel {}".format(channel + 1)
 			)
 		if self._has_em:
 			await ch.setup_em()
@@ -324,6 +339,52 @@ class ShellyDevice(object):
 
 	async def get_device_info(self):
 		return await self._rpc_call("Shelly.GetDeviceInfo")
+
+	async def channel_name(self, channel, name=None):
+		if name is not None:
+			logger.debug("Setting channel name for shelly device %s channel %d to: %s", self._serial, channel, name)
+			await self._rpc_call("Switch.SetConfig" if self._has_switch else "EM.SetConfig", {"id": channel, "config": {"name": name}})
+			return None
+
+		# Return channel name if set, otherwise return the device name + channel nr.
+		# If both of them are not set, return a generic name.
+		# Note that if the channel name is not set, it will be set on the shelly device to the name returned here.
+		else:
+			config = await self.request_channel_config(channel)
+			if config is not None and 'name' in config and config['name']:
+				return config['name']
+			else:
+				# Fallback to default name
+				info = await self.get_device_info()
+				if info and 'name' in info and info['name']:
+					return f"{info['name']} [{channel}]"
+				else:
+					return f'Shelly {self._serial} [{channel}]'
+
+	async def get_channel_configs(self):
+		channels = []
+		ch = 0
+		while True:
+			resp = await self.request_channel_config(ch)
+			if resp is not None:
+				channels.append(resp)
+				ch += 1
+			else:
+				return channels
+
+	async def get_channels(self):
+		channels = []
+		ch = 0
+		while True:
+			resp = await self.request_channel_status(ch)
+			if resp is not None:
+				channels.append(resp)
+				ch += 1
+			else:
+				return channels
+
+	async def request_channel_config(self, channel):
+		return await self._rpc_call("Switch.GetConfig" if self.has_switch else "EM.GetConfig", {"id": channel})
 
 	async def get_num_phases(self):
 		status = await self.request_channel_status(0)
@@ -368,8 +429,19 @@ class ShellyDevice(object):
 			self.set_event("disconnected")
 
 		elif update_type == RpcUpdateType.EVENT:
-			# TODO: Anything that needs to be handled?
-			pass
+			for event in cb_device.event['events']:
+				if event['event'] == "config_changed":
+					config = cb_device.config
+					# TODO: device restart required.
+					if event['restart_required']:
+						logger.info("Shelly device %s configuration changed, restart required", self._serial)
+					else:
+						for channel in self._channels.keys():
+							conf = config[f'switch:{channel}']
+							if conf:
+								self._channels[channel].channel_config_changed()
+
+								# TODO: maybe notify the discovery service about the channel name change?
 
 	def parse_status(self, channel, status_json):
 		self._channels[channel].update(status_json)

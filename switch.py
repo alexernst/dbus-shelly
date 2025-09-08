@@ -36,7 +36,7 @@ MODULE_STATE_UNDER_VOLTAGE = 0x105
 # Base class for all switching devices.
 class SwitchDevice(object):
 
-	async def add_output(self, channel, output_type, set_state_cb, valid_functions=(1 << OutputFunction.MANUAL) | 0, name="", customName="", set_dimming_cb=None):
+	async def add_output(self, channel, output_type, set_state_cb, valid_functions=(1 << OutputFunction.MANUAL) | 0, name="", set_dimming_cb=None):
 		path_base  = '/SwitchableOutput/%s/' % channel
 		self.service.add_item(IntegerItem(path_base + 'State', 0, writeable=True, onchange=set_state_cb))
 		self.service.add_item(IntegerItem(path_base + 'Status', 0, writeable=False, text=self._status_text_callback))
@@ -51,7 +51,7 @@ class SwitchDevice(object):
 		validTypesMomentary = 1 << OutputType.MOMENTARY.value
 
 		self.service.add_item(TextItem(path_base + 'Settings/Group', "", writeable=True, onchange=partial(self._value_changed, path_base + 'Settings/Group')))
-		self.service.add_item(TextItem(path_base + 'Settings/CustomName', customName, writeable=True, onchange=partial(self._value_changed, path_base + 'Settings/CustomName')))
+		self.service.add_item(TextItem(path_base + 'Settings/CustomName', await self.channel_name_cb(), writeable=True, onchange=self._set_output_customname))
 		self.service.add_item(IntegerItem(path_base + 'Settings/ShowUIControl', 1, writeable=True, onchange=partial(self._value_changed, path_base + 'Settings/ShowUIControl')))
 		self.service.add_item(IntegerItem(path_base + 'Settings/Type', output_type, writeable=True, onchange=partial(self._value_changed, path_base + 'Settings/Type'),
 							text=self._type_text_callback))
@@ -67,7 +67,6 @@ class SwitchDevice(object):
 		base = self._settings_base + '%s/' % channel
 		await self.settings.add_settings(
 			Setting(base + 'Group', "", alias=f'Group_{self._serial}_{channel}'),
-			Setting(base + 'CustomName', "", alias=f'CustomName_{self._serial}_{channel}'),
 			Setting(base + 'ShowUIControl', 1, _min=0, _max=1, alias=f'ShowUIControl_{self._serial}_{channel}'),
 			Setting(base + 'Function', int(OutputFunction.MANUAL), _min=0, _max=6, alias=f'Function_{self._serial}_{channel}'),
 			Setting(base + 'Type', output_type, _min=0, _max=2, alias=f'Type_{self._serial}_{channel}'),
@@ -84,12 +83,15 @@ class SwitchDevice(object):
 		try:
 			with self.service as s:
 				s['/SwitchableOutput/%s/Settings/Group' % channel] = self.settings.get_value(self.settings.alias(f'Group_{self._serial}_{channel}'))
-				s['/SwitchableOutput/%s/Settings/CustomName' % channel] = self.settings.get_value(self.settings.alias(f'CustomName_{self._serial}_{channel}'))
 				s['/SwitchableOutput/%s/Settings/ShowUIControl' % channel] = self.settings.get_value(self.settings.alias(f'ShowUIControl_{self._serial}_{channel}'))
 				s['/SwitchableOutput/%s/Settings/Function' % channel] = self.settings.get_value(self.settings.alias(f'Function_{self._serial}_{channel}'))
 				s['/SwitchableOutput/%s/Settings/Type' % channel] = self.settings.get_value(self.settings.alias(f'Type_{self._serial}_{channel}'))
 		except :
 			pass
+
+	async def _set_output_customname(self, item, value):
+		item = self.service.get_item('/CustomName')
+		await self._set_customname(item, value)
 
 	async def _value_changed(self, path, item, value):
 		split = path.split('/')

@@ -4,6 +4,7 @@ from __future__ import annotations
 import sys
 import os
 import asyncio
+import re
 from functools import partial
 
 # aiovelib
@@ -181,18 +182,28 @@ class ShellyDiscovery(object):
 			return None, 0
 
 		info = await shelly.get_device_info()
+		configs = await shelly.get_channel_configs()
 
 		# Report shelly energy meter as device with one channel, so it shows up once in the UI
-		num_channels = len(await shelly.get_channels()) if shelly.has_switch else 1
+		num_channels = len(configs) if shelly.has_switch else 1
+
+		channel_names = [await shelly.channel_name(i) for i in range(num_channels)]
 
 		await shelly.stop()
 		del shelly
-		return info, num_channels
+		return info, channel_names
 
 	def on_service_state_change(self, zeroconf, service_type, name, state_change):
-		task = asyncio.get_event_loop().create_task(self._on_service_state_change_async(zeroconf, service_type, name, state_change))
-		background_tasks.add(task)
-		task.add_done_callback(background_tasks.discard)
+		rgx = re.compile(
+			r"^shelly[\d\w\-]+-[0-9a-f]{12}\._shelly\._tcp\.local\.$"
+		)
+
+		if rgx.match(name):
+			task = asyncio.get_event_loop().create_task(self._on_service_state_change_async(zeroconf, service_type, name, state_change))
+			task.add_done_callback(background_tasks.discard)
+			background_tasks.add(task)
+		else:
+			logger.warning("name {} does not match expected service name pattern. ignoring.".format(name))
 
 	async def _on_service_state_change_async(self, zeroconf, service_type, name, state_change):
 		async with lock:
@@ -204,7 +215,8 @@ class ShellyDiscovery(object):
 
 			if state_change == ServiceStateChange.Added or state_change == ServiceStateChange.Updated and serial not in self.discovered_devices:
 				logger.info("Found shelly device: %s", serial)
-				device_info, num_channels = await self._get_device_info(info.server)
+				device_info, channel_names = await self._get_device_info(info.server)
+				num_channels = len(channel_names)
 				if device_info is None:
 					logger.error("Failed to get device info for %s", serial)
 					return
@@ -234,8 +246,13 @@ class ShellyDiscovery(object):
 					else:
 						enabled_item = self.service.get_item('/Devices/{}/{}/Enabled'.format(serial, i))
 
+					if self.service.get_item('/Devices/{}/{}/Name'.format(serial, i)) is None:
+						name_item = TextItem('/Devices/{}/{}/Name'.format(serial, i), writeable=False)
+						self.service.add_item(name_item)
+
 					with self.service as s:
 						s['/Devices/{}/{}/Enabled'.format(serial, i)] = enabled
+						s['/Devices/{}/{}/Name'.format(serial, i)] = channel_names[i]
 
 					if enabled:
 						await self._on_enabled_changed(serial, i, enabled_item, enabled)
